@@ -1,0 +1,124 @@
+name: Deploy to AKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Commit SHA to deploy (e.g., abc1234) - leave empty to build from dev branch'
+        required: false
+        type: string
+      force_dev_deploy:
+        description: 'Build and deploy current dev branch'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  DOCKERHUB_USERNAME: gaganr31
+  IMAGE_NAME: demo
+  NAMESPACE: default
+  DEPLOYMENT_NAME: demo
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.force_dev_deploy && 'dev' || github.ref }}
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Configure kubectl with kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          
+          # Test connection
+          kubectl cluster-info
+          kubectl get nodes
+      
+      - name: Determine image tag
+        id: image
+        run: |
+          if [ "${{ github.event.inputs.force_dev_deploy }}" == "true" ]; then
+            # Build from current dev branch
+            COMMIT_SHA=$(git rev-parse --short HEAD)
+            echo "build_required=true" >> $GITHUB_OUTPUT
+          elif [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            # Use provided commit SHA
+            COMMIT_SHA="${{ github.event.inputs.image_tag }}"
+            echo "build_required=false" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Either provide image_tag or check force_dev_deploy"
+            exit 1
+          fi
+          
+          FULL_IMAGE="${{ env.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${COMMIT_SHA}"
+          echo "sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Deploying image: ${FULL_IMAGE}"
+      
+      - name: Set up Docker Buildx
+        if: steps.image.outputs.build_required == 'true'
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        if: steps.image.outputs.build_required == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Build and push dev image
+        if: steps.image.outputs.build_required == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.full_image }}
+      
+      - name: Deploy to AKS using kubectl set image
+        run: |
+          echo "Updating deployment image to: ${{ steps.image.outputs.full_image }}"
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+            ${{ env.DEPLOYMENT_NAME }}=${{ steps.image.outputs.full_image }} \
+            -n ${{ env.NAMESPACE }} \
+            --record
+      
+      - name: Wait for rollout to complete
+        run: |
+          echo "Waiting for deployment rollout..."
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+          echo "✅ Deployment completed successfully!"
+      
+      - name: Get deployment status
+        run: |
+          echo "=== Current Deployment Image ==="
+          kubectl get deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.template.spec.containers[0].image}'
+          echo ""
+          echo ""
+          echo "=== Running Pods ==="
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} -o wide
+      
+      - name: Deployment summary
+        run: |
+          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ steps.image.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA:** \`${{ steps.image.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace:** \`${{ env.NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment:** \`${{ env.DEPLOYMENT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Built from dev:** \`${{ steps.image.outputs.build_required }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Running Pods" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
