@@ -27,7 +27,9 @@ jobs:
         run: |
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             echo "Running on PR event"
-            CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+            BASE_BRANCH="${{ github.base_ref }}"
+            echo "Comparing against base branch: ${BASE_BRANCH}"
+            CHANGED_FILES=$(git diff --name-only origin/${BASE_BRANCH}...HEAD)
           else
             echo "Running on push/merge event"
             if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
@@ -38,6 +40,10 @@ jobs:
               CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
             fi
           fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          echo "---"
 
           code_changed=false
           changed_services=""
