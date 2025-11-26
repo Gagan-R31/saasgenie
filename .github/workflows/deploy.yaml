@@ -1,124 +1,155 @@
-name: Deploy to AKS
+name: Build & Deploy
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      image_tag:
-        description: 'Commit SHA to deploy (e.g., abc1234) - leave empty to build from dev branch'
-        required: false
+      changed_services:
         type: string
-      force_dev_deploy:
-        description: 'Build and deploy current dev branch'
-        required: false
-        type: boolean
-        default: false
-
-env:
-  DOCKERHUB_USERNAME: gaganr31
-  IMAGE_NAME: demo
-  NAMESPACE: default
-  DEPLOYMENT_NAME: demo
+        required: true
+    secrets:
+      REGISTRY_PASSWORD:
+        required: true
+      KUBECONFIG:
+        required: true
 
 jobs:
-  deploy:
+  build_and_deploy:
     runs-on: ubuntu-latest
-    
+    environment: default
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      # Setup Buildx
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Setup cache
+      - name: Setup Docker cache
+        uses: actions/cache@v4
+        id: docker-cache
         with:
-          ref: ${{ github.event.inputs.force_dev_deploy && 'dev' || github.ref }}
-      
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'latest'
-      
-      - name: Configure kubectl with kubeconfig
+          path: /tmp/.buildx-cache
+          key: buildx-${{ github.sha }}
+          restore-keys: |
+            buildx-
+
+      - name: Setup kubeconfig
         run: |
           mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
           
           # Test connection
           kubectl cluster-info
           kubectl get nodes
-      
-      - name: Determine image tag
-        id: image
+
+      - name: Log in to container registry
+        uses: docker/login-action@v2
+        with:
+            registry: ${{ vars.REGISTRY_URL }}
+            username: ${{ vars.REGISTRY_USERNAME }}
+            password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build Docker Images
         run: |
-          if [ "${{ github.event.inputs.force_dev_deploy }}" == "true" ]; then
-            # Build from current dev branch
-            COMMIT_SHA=$(git rev-parse --short HEAD)
-            echo "build_required=true" >> $GITHUB_OUTPUT
-          elif [ -n "${{ github.event.inputs.image_tag }}" ]; then
-            # Use provided commit SHA
-            COMMIT_SHA="${{ github.event.inputs.image_tag }}"
-            echo "build_required=false" >> $GITHUB_OUTPUT
-          else
-            echo "Error: Either provide image_tag or check force_dev_deploy"
-            exit 1
+          changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
+          for service in $changed_services; do
+            echo "Building $service..."
+            cd services/$service
+            
+            # Determine image name based on service
+            if [ "$service" == "web-ui" ]; then
+              IMAGE_NAME="demo"
+            else
+              IMAGE_NAME="mg-fp-$service"
+            fi
+            
+            FALCON_HOME=$GITHUB_WORKSPACE KUBE_ENV=dev make build \
+              REGISTRY=${{ vars.REGISTRY_URL }}/${{ vars.REGISTRY_USERNAME }} \
+              IMAGE_NAME=$IMAGE_NAME \
+              IMAGE_TAG_SHA=${{ github.sha }} \
+              SHOULD_CACHE=true SHOULD_PUSH=false
+            cd -
+          done
+      
+      - name: Push Docker Images
+        if: github.ref == 'refs/heads/main'
+        run: |
+          changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
+          for service in $changed_services; do
+            echo "Pushing $service..."
+            
+            # Determine image name based on service
+            if [ "$service" == "web-ui" ]; then
+              IMAGE_NAME="demo"
+            else
+              IMAGE_NAME="mg-fp-$service"
+            fi
+            
+            IMAGE_TAG=${{ vars.REGISTRY_URL }}/${{ vars.REGISTRY_USERNAME }}/$IMAGE_NAME
+            docker push $IMAGE_TAG:${{ github.sha }}
+            docker push $IMAGE_TAG:latest
+          done
+
+      # Deploy to Kubernetes
+      - name: Deploy to K8s
+        if: github.ref == 'refs/heads/main'
+        run: |
+          kubectl config current-context
+
+          changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
+
+          if [ -z "$changed_services" ]; then
+            echo "No services to deploy."
+            exit 0
           fi
+
+          for service in $changed_services; do
+            echo "Processing deployment for: $service"
+            
+            # Handle web-ui service
+            if [ "$service" == "web-ui" ]; then
+              cd services/$service
+              echo "Deploying $service..."
+
+              # Update the image in deployment.yaml
+              sed -i'' -e "s|image: .*|image: ${{ vars.REGISTRY_URL }}/${{ vars.REGISTRY_USERNAME }}/demo:${{ github.sha }}|g" k8s/base/deployment.yaml
+
+              # Deploy using Makefile
+              FALCON_HOME=$GITHUB_WORKSPACE make deploy KUBE_ENV=dev
+              cd -
+            fi
+            
+            # Handle rest-controller service (original logic)
+            if [ "$service" == "rest-controller" ]; then
+              cd services/$service
+              echo "Deploying $service..."
+
+              # Use the versioned image to trigger deployment
+              sed -i'' -e "s|image: .*|image: ${{ vars.REGISTRY_URL }}/mg-fp-${service}:${{ github.sha }}|g" k8s/base/deployment.yaml
+
+              FALCON_HOME=$GITHUB_WORKSPACE make deploy KUBE_ENV=dev
+              cd -
+            fi
+        
+            # Handle kafka-ui service (original logic)
+            if [ "$service" == "kafka-ui" ]; then
+              echo "Deploying $service..."
+              kubectl apply -k services/${service}/k8s/base
+              cd -
+            fi
+          done
           
-          FULL_IMAGE="${{ env.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${COMMIT_SHA}"
-          echo "sha=${COMMIT_SHA}" >> $GITHUB_OUTPUT
-          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-          echo "Deploying image: ${FULL_IMAGE}"
-      
-      - name: Set up Docker Buildx
-        if: steps.image.outputs.build_required == 'true'
-        uses: docker/setup-buildx-action@v3
-      
-      - name: Log in to Docker Hub
-        if: steps.image.outputs.build_required == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ env.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      
-      - name: Build and push dev image
-        if: steps.image.outputs.build_required == 'true'
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.image.outputs.full_image }}
-      
-      - name: Deploy to AKS using kubectl set image
+      - name: Verify Deployment
+        if: github.ref == 'refs/heads/main'
         run: |
-          echo "Updating deployment image to: ${{ steps.image.outputs.full_image }}"
-          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
-            ${{ env.DEPLOYMENT_NAME }}=${{ steps.image.outputs.full_image }} \
-            -n ${{ env.NAMESPACE }} \
-            --record
-      
-      - name: Wait for rollout to complete
-        run: |
-          echo "Waiting for deployment rollout..."
-          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
-          echo "✅ Deployment completed successfully!"
-      
-      - name: Get deployment status
-        run: |
-          echo "=== Current Deployment Image ==="
-          kubectl get deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.template.spec.containers[0].image}'
-          echo ""
-          echo ""
-          echo "=== Running Pods ==="
-          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} -o wide
-      
-      - name: Deployment summary
-        run: |
-          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image:** \`${{ steps.image.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit SHA:** \`${{ steps.image.outputs.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Namespace:** \`${{ env.NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployment:** \`${{ env.DEPLOYMENT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Built from dev:** \`${{ steps.image.outputs.build_required }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Running Pods" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
+          
+          for service in $changed_services; do
+            if [ "$service" == "web-ui" ]; then
+              echo "Verifying web-ui deployment..."
+              kubectl get deployment demo -n default
+              kubectl get pods -n default -l app=demo
+              echo "✅ Web UI deployment verified"
+            fi
+          done

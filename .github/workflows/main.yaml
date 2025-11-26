@@ -1,0 +1,27 @@
+name: Falcon Prime CI/CD
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: ["main"]
+
+jobs:
+  detect_changes:
+    uses: ./.github/workflows/detect-changes.yaml
+
+  verify:
+    if: ${{ needs.detect_changes.outputs.code_changed == 'true' }}
+    needs: detect_changes
+    uses: ./.github/workflows/verify.yaml
+    with:
+      code_changed: ${{ needs.detect_changes.outputs.code_changed }}
+      changed_services: ${{ needs.detect_changes.outputs.changed_services }}
+
+  deploy:
+    needs: [verify, detect_changes]
+    uses: ./.github/workflows/deploy.yaml
+    with:
+      changed_services: ${{ needs.detect_changes.outputs.changed_services }}
+    secrets:
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      KUBECONFIG: ${{ secrets.KUBECONFIG }}

@@ -1,0 +1,58 @@
+name: Verify
+
+on:
+  workflow_call:
+    inputs:
+      changed_services:
+        type: string
+        required: true
+      code_changed:
+        type: string
+        required: true
+
+jobs:
+  verify:
+    name: Verify ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    outputs:
+      changed_services: ${{ steps.verify.outputs.changed_services }}
+      code_changed: ${{ steps.verify.outputs.code_changed }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Safely parse JSON or default to an empty array
+       service: ${{ fromJson(inputs.changed_services || '[]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found in services/${{ matrix.service }}"
+          fi
+
+      - name: Build other make dependencies
+        working-directory: base-images
+        run: |
+          FALCON_HOME=${{ github.workspace }} KUBE_ENV=dev make build-lint
+
+      - name: Run formatting
+        working-directory: services/${{ matrix.service }}
+        run: |
+          FALCON_HOME=${{ github.workspace }} KUBE_ENV=dev make check-format
+
+      - name: Run linting
+        working-directory: services/${{ matrix.service }}
+        run: echo "No linting defined yet"
+
+      - name: Run tests
+        working-directory: services/${{ matrix.service }}
+        run: FALCON_HOME=${{ github.workspace }} KUBE_ENV=dev make test SHOULD_PUSH=false
+      
+      - name: Output
+        id: verify
+        run: |
+          echo "changed_services=${{ inputs.changed_services }}" >> "$GITHUB_OUTPUT"
+          echo "code_changed=${{ inputs.code_changed }}" >> "$GITHUB_OUTPUT"

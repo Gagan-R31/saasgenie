@@ -1,0 +1,77 @@
+name: Detect Changes
+
+on:
+  workflow_call:
+    outputs:
+      changed_services:
+        description: "List of changed services"
+        value: ${{ jobs.detect.outputs.changed_services }}
+      code_changed:
+        description: "Whether code changed"
+        value: ${{ jobs.detect.outputs.code_changed }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      changed_services: ${{ steps.detect.outputs.changed_services }}
+      code_changed: ${{ steps.detect.outputs.code_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - id: detect
+        shell: bash
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            echo "Running on PR event"
+            CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+          else
+            echo "Running on push/merge event"
+            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+              echo "Detected merge commit - comparing merge parents"
+              CHANGED_FILES=$(git diff --name-only HEAD^1 HEAD^2)
+            else
+              echo "Regular commit - comparing with parent"
+              CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+            fi
+          fi
+
+          code_changed=false
+          changed_services=""
+
+          if echo "$CHANGED_FILES" | grep -Eq '^(services|libs)/'; then
+            code_changed=true
+          fi
+
+          for service_dir in services/*; do
+            [ -d "$service_dir" ] || continue
+            service_name=$(basename "$service_dir")
+            if echo "$CHANGED_FILES" | grep -q "^services/$service_name/"; then
+              changed_services="$changed_services $service_name"
+            fi
+          done
+
+          if echo "$CHANGED_FILES" | grep -q '^libs/'; then
+            for service_dir in services/*; do
+              [ -d "$service_dir" ] || continue
+              service_name=$(basename "$service_dir")
+              changed_services="$changed_services $service_name"
+            done
+          fi
+
+          changed_services=$(echo "$changed_services" | tr ' ' '\n' | sort -u | xargs)
+
+          if [ -z "$changed_services" ]; then
+            changed_services_json="[]"
+          else
+            changed_services_json=$(printf '%s\n' $changed_services | jq -R . | jq -s -c .)
+          fi
+
+          echo "Changed services: $changed_services ; Code changed: $code_changed"
+          echo "JSON array: $changed_services_json"
+
+          echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
+          echo "changed_services=$changed_services_json" >> "$GITHUB_OUTPUT"
