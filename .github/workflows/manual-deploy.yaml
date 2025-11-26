@@ -1,0 +1,135 @@
+name: Manual Deploy to AKS
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select image to deploy'
+        required: true
+        type: choice
+        options:
+          - staging
+          - feat
+          - production
+      image_tag:
+        description: 'Specific commit SHA to deploy (optional - leave empty to use environment tag)'
+        required: false
+        type: string
+
+env:
+  NAMESPACE: default
+  DEPLOYMENT_NAME: demo
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.environment == 'staging' && 'staging' || github.event.inputs.environment == 'production' && 'main' || github.ref }}
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Configure kubectl with kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          
+          # Test connection
+          echo "Testing cluster connection..."
+          kubectl cluster-info
+          kubectl get nodes
+      
+      - name: Determine image tag
+        id: image
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            # Use specific commit SHA if provided
+            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+            echo "Using specific commit: ${IMAGE_TAG}"
+          else
+            # Use environment tag
+            if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+              IMAGE_TAG="staging"
+            elif [ "${{ github.event.inputs.environment }}" == "production" ]; then
+              IMAGE_TAG="latest"
+            else
+              # For feat, we need a commit SHA
+              echo "ERROR: For feat environment, you must provide a commit SHA"
+              exit 1
+            fi
+            echo "Using environment tag: ${IMAGE_TAG}"
+          fi
+          
+          FULL_IMAGE="gaganr31/demo:${IMAGE_TAG}"
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "Deploying image: ${FULL_IMAGE}"
+      
+      - name: Verify image exists
+        run: |
+          echo "Checking if image exists..."
+          # Try to inspect the image manifest (will fail if image doesn't exist)
+          docker manifest inspect ${{ steps.image.outputs.full_image }} > /dev/null 2>&1 || {
+            echo "❌ ERROR: Image ${{ steps.image.outputs.full_image }} does not exist!"
+            echo "Available images at https://hub.docker.com/r/gaganr31/demo/tags"
+            exit 1
+          }
+          echo "✅ Image exists"
+      
+      - name: Update deployment image
+        run: |
+          echo "Updating deployment image to: ${{ steps.image.outputs.full_image }}"
+          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+            ${{ env.DEPLOYMENT_NAME }}=${{ steps.image.outputs.full_image }} \
+            -n ${{ env.NAMESPACE }} \
+            --record
+      
+      - name: Wait for rollout to complete
+        run: |
+          echo "Waiting for deployment rollout..."
+          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+          echo "✅ Deployment completed successfully!"
+      
+      - name: Get deployment status
+        run: |
+          echo "=== Current Deployment ==="
+          kubectl get deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} -o wide
+          
+          echo ""
+          echo "=== Current Image ==="
+          kubectl get deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} -o jsonpath='{.spec.template.spec.containers[0].image}'
+          echo ""
+          
+          echo ""
+          echo "=== Running Pods ==="
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} -o wide
+          
+          echo ""
+          echo "=== Pod Details ==="
+          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} | grep -A 5 "Image:"
+      
+      - name: Deployment summary
+        run: |
+          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** \`${{ github.event.inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ steps.image.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag:** \`${{ steps.image.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace:** \`${{ env.NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment:** \`${{ env.DEPLOYMENT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Running Pods" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

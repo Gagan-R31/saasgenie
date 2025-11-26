@@ -1,9 +1,14 @@
-name: Falcon Prime CI/CD
+name: CI/CD Pipeline
+
 on:
   pull_request:
+    branches: 
+      - main
+      - staging
     types: [opened, synchronize, reopened]
   push:
-    branches: ["main"]
+    branches: 
+      - main
 
 jobs:
   detect_changes:
@@ -17,11 +22,57 @@ jobs:
       code_changed: ${{ needs.detect_changes.outputs.code_changed }}
       changed_services: ${{ needs.detect_changes.outputs.changed_services }}
 
-  deploy:
+  build_and_push:
     needs: [verify, detect_changes]
-    uses: ./.github/workflows/deploy.yaml
+    uses: ./.github/workflows/build-push.yaml
     with:
       changed_services: ${{ needs.detect_changes.outputs.changed_services }}
     secrets:
       REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-      KUBECONFIG: ${{ secrets.KUBECONFIG }}
+
+  auto_deploy_production:
+    # Auto-deploy only when pushing to main
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [build_and_push, detect_changes]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+          kubectl cluster-info
+      
+      - name: Deploy to production
+        run: |
+          changed_services=$(echo '${{ needs.detect_changes.outputs.changed_services }}' | jq -r '.[]')
+          
+          for service in $changed_services; do
+            if [ "$service" == "web-ui" ]; then
+              echo "Deploying web-ui to production..."
+              
+              # Update to latest tag (production)
+              kubectl set image deployment/demo \
+                demo=gaganr31/demo:latest \
+                -n default \
+                --record
+              
+              # Wait for rollout
+              kubectl rollout status deployment/demo -n default --timeout=5m
+              
+              echo "✅ Production deployment complete"
+            fi
+          done
+      
+      - name: Verify deployment
+        run: |
+          kubectl get deployment demo -n default
+          kubectl get pods -n default -l app=demo
