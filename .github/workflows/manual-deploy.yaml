@@ -3,92 +3,189 @@ name: Manual Deploy to AKS
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Select image to deploy'
+      branch_name:
+        description: 'Branch name to build and deploy'
+        required: true
+        type: string
+        default: 'main'
+      service_name:
+        description: 'Service to deploy'
         required: true
         type: choice
         options:
-          - staging
-          - feat
-          - production
-      image_tag:
-        description: 'Specific commit SHA to deploy (optional - leave empty to use environment tag)'
+          - web-ui
+        default: 'web-ui'
+      skip_build:
+        description: 'Skip build and use existing image tag'
+        required: false
+        type: boolean
+        default: false
+      existing_image_tag:
+        description: 'Existing image tag (only if skip_build is true)'
         required: false
         type: string
 
 env:
   NAMESPACE: default
   DEPLOYMENT_NAME: demo
+  REGISTRY: gaganr31
 
 jobs:
-  deploy:
+  build_and_deploy:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment: 
+      name: ${{ github.event.inputs.branch_name == 'main' && 'production' || github.event.inputs.branch_name == 'staging' && 'staging' || 'development' }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.environment == 'staging' && 'staging' || github.event.inputs.environment == 'production' && 'main' || github.ref }}
+          ref: ${{ github.event.inputs.branch_name }}
+          fetch-depth: 0
       
+      - name: Set up Docker Buildx
+        if: ${{ github.event.inputs.skip_build != 'true' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        if: ${{ github.event.inputs.skip_build != 'true' }}
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.REGISTRY }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Determine image details
+        id: image
+        run: |
+          SERVICE="${{ github.event.inputs.service_name }}"
+          BRANCH="${{ github.event.inputs.branch_name }}"
+          
+          # Determine image name
+          if [ "$SERVICE" == "web-ui" ]; then
+            IMAGE_NAME="demo"
+          else
+            IMAGE_NAME="mg-fp-$SERVICE"
+          fi
+          
+          # Sanitize branch name for Docker tag
+          BRANCH_TAG=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          
+          # Determine image tag
+          if [ "${{ github.event.inputs.skip_build }}" == "true" ]; then
+            if [ -z "${{ github.event.inputs.existing_image_tag }}" ]; then
+              echo "ERROR: existing_image_tag is required when skip_build is true"
+              exit 1
+            fi
+            IMAGE_TAG="${{ github.event.inputs.existing_image_tag }}"
+            echo "Using existing image tag: ${IMAGE_TAG}"
+          else
+            # Use commit SHA for new builds
+            IMAGE_TAG="${{ github.sha }}"
+            echo "Building new image with tag: ${IMAGE_TAG}"
+          fi
+          
+          FULL_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME}:${IMAGE_TAG}"
+          
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "branch_tag=${BRANCH_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "service=${SERVICE}" >> $GITHUB_OUTPUT
+          
+          echo "Image details:"
+          echo "  - Service: ${SERVICE}"
+          echo "  - Image name: ${IMAGE_NAME}"
+          echo "  - Image tag: ${IMAGE_TAG}"
+          echo "  - Branch tag: ${BRANCH_TAG}"
+          echo "  - Full image: ${FULL_IMAGE}"
+
+      - name: Build Docker Image
+        if: ${{ github.event.inputs.skip_build != 'true' }}
+        run: |
+          SERVICE="${{ steps.image.outputs.service }}"
+          IMAGE_NAME="${{ steps.image.outputs.image_name }}"
+          IMAGE_TAG="${{ steps.image.outputs.image_tag }}"
+          BRANCH_TAG="${{ steps.image.outputs.branch_tag }}"
+          
+          echo "Building ${SERVICE}..."
+          cd services/${SERVICE}
+          
+          FALCON_HOME=$GITHUB_WORKSPACE KUBE_ENV=dev make build \
+            REGISTRY=${{ env.REGISTRY }} \
+            IMAGE_NAME=${IMAGE_NAME} \
+            IMAGE_TAG_SHA=${IMAGE_TAG} \
+            SHOULD_CACHE=true SHOULD_PUSH=false
+          
+          cd -
+          
+          echo "✅ Build complete"
+
+      - name: Push Docker Image
+        if: ${{ github.event.inputs.skip_build != 'true' }}
+        run: |
+          IMAGE_NAME="${{ steps.image.outputs.image_name }}"
+          IMAGE_TAG="${{ steps.image.outputs.image_tag }}"
+          BRANCH_TAG="${{ steps.image.outputs.branch_tag }}"
+          BASE_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME}"
+          
+          # Push commit SHA tag
+          docker push ${BASE_IMAGE}:${IMAGE_TAG}
+          echo "✅ Pushed: ${BASE_IMAGE}:${IMAGE_TAG}"
+          
+          # Push branch-specific tag
+          docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:${BRANCH_TAG}
+          docker push ${BASE_IMAGE}:${BRANCH_TAG}
+          echo "✅ Pushed: ${BASE_IMAGE}:${BRANCH_TAG}"
+          
+          # Push additional tags for main/staging
+          if [ "${{ github.event.inputs.branch_name }}" == "main" ]; then
+            docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:latest
+            docker push ${BASE_IMAGE}:latest
+            echo "✅ Pushed: ${BASE_IMAGE}:latest"
+            
+            docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:production
+            docker push ${BASE_IMAGE}:production
+            echo "✅ Pushed: ${BASE_IMAGE}:production"
+          elif [ "${{ github.event.inputs.branch_name }}" == "staging" ]; then
+            docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:staging
+            docker push ${BASE_IMAGE}:staging
+            echo "✅ Pushed: ${BASE_IMAGE}:staging"
+          fi
+
+      - name: Verify image exists
+        run: |
+          echo "Verifying image exists..."
+          FULL_IMAGE="${{ steps.image.outputs.full_image }}"
+          
+          docker manifest inspect ${FULL_IMAGE} > /dev/null 2>&1 || {
+            echo "❌ ERROR: Image ${FULL_IMAGE} does not exist!"
+            echo "Available images at https://hub.docker.com/r/${{ env.REGISTRY }}/${{ steps.image.outputs.image_name }}/tags"
+            exit 1
+          }
+          echo "✅ Image exists and is ready for deployment"
+
       - name: Setup kubectl
         uses: azure/setup-kubectl@v3
         with:
           version: 'latest'
       
-      - name: Configure kubectl with kubeconfig
+      - name: Configure kubectl
         run: |
           mkdir -p $HOME/.kube
           echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
           
-          # Test connection
           echo "Testing cluster connection..."
           kubectl cluster-info
           kubectl get nodes
-      
-      - name: Determine image tag
-        id: image
-        run: |
-          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
-            # Use specific commit SHA if provided
-            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
-            echo "Using specific commit: ${IMAGE_TAG}"
-          else
-            # Use environment tag
-            if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
-              IMAGE_TAG="staging"
-            elif [ "${{ github.event.inputs.environment }}" == "production" ]; then
-              IMAGE_TAG="latest"
-            else
-              # For feat, we need a commit SHA
-              echo "ERROR: For feat environment, you must provide a commit SHA"
-              exit 1
-            fi
-            echo "Using environment tag: ${IMAGE_TAG}"
-          fi
-          
-          FULL_IMAGE="gaganr31/demo:${IMAGE_TAG}"
-          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-          echo "Deploying image: ${FULL_IMAGE}"
-      
-      - name: Verify image exists
-        run: |
-          echo "Checking if image exists..."
-          # Try to inspect the image manifest (will fail if image doesn't exist)
-          docker manifest inspect ${{ steps.image.outputs.full_image }} > /dev/null 2>&1 || {
-            echo "❌ ERROR: Image ${{ steps.image.outputs.full_image }} does not exist!"
-            echo "Available images at https://hub.docker.com/r/gaganr31/demo/tags"
-            exit 1
-          }
-          echo "✅ Image exists"
-      
+
       - name: Update deployment image
         run: |
-          echo "Updating deployment image to: ${{ steps.image.outputs.full_image }}"
+          FULL_IMAGE="${{ steps.image.outputs.full_image }}"
+          
+          echo "Updating deployment image to: ${FULL_IMAGE}"
           kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
-            ${{ env.DEPLOYMENT_NAME }}=${{ steps.image.outputs.full_image }} \
+            ${{ env.DEPLOYMENT_NAME }}=${FULL_IMAGE} \
             -n ${{ env.NAMESPACE }} \
             --record
       
@@ -111,19 +208,16 @@ jobs:
           echo ""
           echo "=== Running Pods ==="
           kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} -o wide
-          
-          echo ""
-          echo "=== Pod Details ==="
-          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} | grep -A 5 "Image:"
       
       - name: Deployment summary
         run: |
           echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
-          echo "- **Environment:** \`${{ github.event.inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch:** \`${{ github.event.inputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service:** \`${{ steps.image.outputs.service }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Image:** \`${{ steps.image.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image Tag:** \`${{ steps.image.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Built from source:** \`${{ github.event.inputs.skip_build != 'true' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Namespace:** \`${{ env.NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Deployment:** \`${{ env.DEPLOYMENT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Deployed by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
