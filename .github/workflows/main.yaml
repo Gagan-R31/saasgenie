@@ -9,6 +9,7 @@ on:
   push:
     branches: 
       - main
+      - staging
 
 jobs:
   detect_changes:
@@ -27,11 +28,12 @@ jobs:
     uses: ./.github/workflows/build-push.yaml
     with:
       changed_services: ${{ needs.detect_changes.outputs.changed_services }}
+      source_branch: ${{ github.head_ref || github.ref_name }}
     secrets:
       REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
 
   auto_deploy_production:
-    # Auto-deploy only when pushing to main
+    # Auto-deploy only when pushing to main (after merge)
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [build_and_push, detect_changes]
     runs-on: ubuntu-latest

@@ -3,102 +3,263 @@ name: Manual Deploy to AKS
 on:
   workflow_dispatch:
     inputs:
-      environment:
-        description: 'Select image to deploy'
+      branch_name:
+        description: 'Branch name to build and deploy'
         required: true
-        type: choice
-        options:
-          - staging
-          - feat
-          - production
-      image_tag:
-        description: 'Specific commit SHA to deploy (optional - leave empty to use environment tag)'
-        required: false
         type: string
+        default: 'main'
 
 env:
   NAMESPACE: default
   DEPLOYMENT_NAME: demo
+  REGISTRY: gaganr31
 
 jobs:
-  deploy:
+  detect_changes:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    outputs:
+      changed_services: ${{ steps.detect.outputs.changed_services }}
+      code_changed: ${{ steps.detect.outputs.code_changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch_name }}
+
+      - id: detect
+        shell: bash
+        run: |
+          BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          echo "Detecting changes in branch: ${BRANCH_NAME}"
+          
+          # Compare with main branch to detect what services exist/changed
+          if git rev-parse --verify origin/main >/dev/null 2>&1; then
+            CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+          else
+            # If can't compare with main, just list all services
+            CHANGED_FILES=$(find services -type f)
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          echo "---"
+
+          code_changed=false
+          changed_services=""
+
+          if echo "$CHANGED_FILES" | grep -Eq '^(services|libs)/'; then
+            code_changed=true
+          fi
+
+          for service_dir in services/*; do
+            [ -d "$service_dir" ] || continue
+            service_name=$(basename "$service_dir")
+            if echo "$CHANGED_FILES" | grep -q "^services/$service_name/"; then
+              changed_services="$changed_services $service_name"
+            fi
+          done
+
+          if echo "$CHANGED_FILES" | grep -q '^libs/'; then
+            for service_dir in services/*; do
+              [ -d "$service_dir" ] || continue
+              service_name=$(basename "$service_dir")
+              changed_services="$changed_services $service_name"
+            done
+          fi
+
+          changed_services=$(echo "$changed_services" | tr ' ' '\n' | sort -u | xargs)
+
+          if [ -z "$changed_services" ]; then
+            changed_services_json="[]"
+            echo "No services with changes detected"
+          else
+            changed_services_json=$(printf '%s\n' $changed_services | jq -R . | jq -s -c .)
+            echo "Services with changes: $changed_services"
+          fi
+
+          echo "JSON array: $changed_services_json"
+
+          echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
+          echo "changed_services=$changed_services_json" >> "$GITHUB_OUTPUT"
+
+  build_and_push:
+    needs: detect_changes
+    if: ${{ needs.detect_changes.outputs.changed_services != '[]' && needs.detect_changes.outputs.changed_services != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect_changes.outputs.changed_services) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch_name }}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v2
+        with:
+          username: ${{ env.REGISTRY }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Determine image details
+        id: image
+        run: |
+          SERVICE="${{ matrix.service }}"
+          BRANCH="${{ github.event.inputs.branch_name }}"
+          
+          # Determine image name
+          if [ "$SERVICE" == "web-ui" ]; then
+            IMAGE_NAME="demo"
+          else
+            IMAGE_NAME="mg-fp-$SERVICE"
+          fi
+          
+          # Sanitize branch name for Docker tag
+          BRANCH_TAG=$(echo "$BRANCH" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          
+          # Use commit SHA for tag
+          IMAGE_TAG="${{ github.sha }}"
+          
+          FULL_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME}:${IMAGE_TAG}"
+          
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "branch_tag=${BRANCH_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          
+          echo "Image details:"
+          echo "  - Service: ${SERVICE}"
+          echo "  - Image name: ${IMAGE_NAME}"
+          echo "  - Image tag: ${IMAGE_TAG}"
+          echo "  - Branch tag: ${BRANCH_TAG}"
+          echo "  - Full image: ${FULL_IMAGE}"
+
+      - name: Build Docker Image
+        run: |
+          SERVICE="${{ matrix.service }}"
+          IMAGE_NAME="${{ steps.image.outputs.image_name }}"
+          IMAGE_TAG="${{ steps.image.outputs.image_tag }}"
+          
+          echo "Building ${SERVICE}..."
+          cd services/${SERVICE}
+          
+          FALCON_HOME=$GITHUB_WORKSPACE KUBE_ENV=dev make build \
+            REGISTRY=${{ env.REGISTRY }} \
+            IMAGE_NAME=${IMAGE_NAME} \
+            IMAGE_TAG_SHA=${IMAGE_TAG} \
+            SHOULD_CACHE=true SHOULD_PUSH=false
+          
+          cd -
+          
+          echo "✅ Build complete for ${SERVICE}"
+
+      - name: Push Docker Image
+        run: |
+          IMAGE_NAME="${{ steps.image.outputs.image_name }}"
+          IMAGE_TAG="${{ steps.image.outputs.image_tag }}"
+          BRANCH_TAG="${{ steps.image.outputs.branch_tag }}"
+          BASE_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME}"
+          
+          # Push commit SHA tag
+          docker push ${BASE_IMAGE}:${IMAGE_TAG}
+          echo "✅ Pushed: ${BASE_IMAGE}:${IMAGE_TAG}"
+          
+          # Push branch-specific tag
+          docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:${BRANCH_TAG}
+          docker push ${BASE_IMAGE}:${BRANCH_TAG}
+          echo "✅ Pushed: ${BASE_IMAGE}:${BRANCH_TAG}"
+          
+          # Push additional tags for main/staging
+          if [ "${{ github.event.inputs.branch_name }}" == "main" ]; then
+            docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:latest
+            docker push ${BASE_IMAGE}:latest
+            echo "✅ Pushed: ${BASE_IMAGE}:latest"
+            
+            docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:production
+            docker push ${BASE_IMAGE}:production
+            echo "✅ Pushed: ${BASE_IMAGE}:production"
+          elif [ "${{ github.event.inputs.branch_name }}" == "staging" ]; then
+            docker tag ${BASE_IMAGE}:${IMAGE_TAG} ${BASE_IMAGE}:staging
+            docker push ${BASE_IMAGE}:staging
+            echo "✅ Pushed: ${BASE_IMAGE}:staging"
+          fi
+
+  deploy:
+    needs: [detect_changes, build_and_push]
+    if: ${{ needs.detect_changes.outputs.changed_services != '[]' && needs.detect_changes.outputs.changed_services != '' }}
+    runs-on: ubuntu-latest
+    environment: 
+      name: ${{ github.event.inputs.branch_name == 'main' && 'production' || github.event.inputs.branch_name == 'staging' && 'staging' || 'development' }}
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect_changes.outputs.changed_services) }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.environment == 'staging' && 'staging' || github.event.inputs.environment == 'production' && 'main' || github.ref }}
-      
+          ref: ${{ github.event.inputs.branch_name }}
+
+      - name: Determine image details
+        id: image
+        run: |
+          SERVICE="${{ matrix.service }}"
+          
+          # Determine image name
+          if [ "$SERVICE" == "web-ui" ]; then
+            IMAGE_NAME="demo"
+          else
+            IMAGE_NAME="mg-fp-$SERVICE"
+          fi
+          
+          IMAGE_TAG="${{ github.sha }}"
+          FULL_IMAGE="${{ env.REGISTRY }}/${IMAGE_NAME}:${IMAGE_TAG}"
+          
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "service=${SERVICE}" >> $GITHUB_OUTPUT
+
       - name: Setup kubectl
         uses: azure/setup-kubectl@v3
         with:
           version: 'latest'
       
-      - name: Configure kubectl with kubeconfig
+      - name: Configure kubectl
         run: |
           mkdir -p $HOME/.kube
           echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
           
-          # Test connection
           echo "Testing cluster connection..."
           kubectl cluster-info
-          kubectl get nodes
-      
-      - name: Determine image tag
-        id: image
+
+      - name: Deploy to AKS
         run: |
-          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
-            # Use specific commit SHA if provided
-            IMAGE_TAG="${{ github.event.inputs.image_tag }}"
-            echo "Using specific commit: ${IMAGE_TAG}"
-          else
-            # Use environment tag
-            if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
-              IMAGE_TAG="staging"
-            elif [ "${{ github.event.inputs.environment }}" == "production" ]; then
-              IMAGE_TAG="latest"
-            else
-              # For feat, we need a commit SHA
-              echo "ERROR: For feat environment, you must provide a commit SHA"
-              exit 1
-            fi
-            echo "Using environment tag: ${IMAGE_TAG}"
-          fi
+          SERVICE="${{ steps.image.outputs.service }}"
+          FULL_IMAGE="${{ steps.image.outputs.full_image }}"
           
-          FULL_IMAGE="gaganr31/demo:${IMAGE_TAG}"
-          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
-          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
-          echo "Deploying image: ${FULL_IMAGE}"
+          # Only deploy web-ui for now (you can extend this for other services)
+          if [ "$SERVICE" == "web-ui" ]; then
+            echo "Deploying ${SERVICE} to AKS..."
+            echo "Image: ${FULL_IMAGE}"
+            
+            kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
+              ${{ env.DEPLOYMENT_NAME }}=${FULL_IMAGE} \
+              -n ${{ env.NAMESPACE }} \
+              --record
+            
+            # Wait for rollout
+            kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
+            
+            echo "✅ Deployment complete for ${SERVICE}"
+          else
+            echo "⏭️  Skipping deployment for ${SERVICE} (no deployment configured)"
+          fi
       
-      - name: Verify image exists
-        run: |
-          echo "Checking if image exists..."
-          # Try to inspect the image manifest (will fail if image doesn't exist)
-          docker manifest inspect ${{ steps.image.outputs.full_image }} > /dev/null 2>&1 || {
-            echo "❌ ERROR: Image ${{ steps.image.outputs.full_image }} does not exist!"
-            echo "Available images at https://hub.docker.com/r/gaganr31/demo/tags"
-            exit 1
-          }
-          echo "✅ Image exists"
-      
-      - name: Update deployment image
-        run: |
-          echo "Updating deployment image to: ${{ steps.image.outputs.full_image }}"
-          kubectl set image deployment/${{ env.DEPLOYMENT_NAME }} \
-            ${{ env.DEPLOYMENT_NAME }}=${{ steps.image.outputs.full_image }} \
-            -n ${{ env.NAMESPACE }} \
-            --record
-      
-      - name: Wait for rollout to complete
-        run: |
-          echo "Waiting for deployment rollout..."
-          kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} --timeout=5m
-          echo "✅ Deployment completed successfully!"
-      
-      - name: Get deployment status
+      - name: Verify deployment
+        if: matrix.service == 'web-ui'
         run: |
           echo "=== Current Deployment ==="
           kubectl get deployment/${{ env.DEPLOYMENT_NAME }} -n ${{ env.NAMESPACE }} -o wide
@@ -111,25 +272,31 @@ jobs:
           echo ""
           echo "=== Running Pods ==="
           kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} -o wide
-          
-          echo ""
-          echo "=== Pod Details ==="
-          kubectl describe pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} | grep -A 5 "Image:"
-      
+
+  summary:
+    needs: [detect_changes, build_and_push, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
       - name: Deployment summary
         run: |
-          echo "## ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
-          echo "- **Environment:** \`${{ github.event.inputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image:** \`${{ steps.image.outputs.full_image }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image Tag:** \`${{ steps.image.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Namespace:** \`${{ env.NAMESPACE }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployment:** \`${{ env.DEPLOYMENT_NAME }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployed by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Deployed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Running Pods" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.detect_changes.outputs.changed_services }}" == "[]" ] || [ -z "${{ needs.detect_changes.outputs.changed_services }}" ]; then
+            echo "## ⏭️ No Deployment Needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Details" >> $GITHUB_STEP_SUMMARY
+            echo "- **Branch:** \`${{ github.event.inputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Reason:** No service changes detected in this branch" >> $GITHUB_STEP_SUMMARY
+            echo "- **Action:** Deployment skipped" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💡 **Tip:** Changes are detected by comparing with the main branch. If this is a new branch with no differences, no deployment will occur." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ✅ Manual Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
+            echo "- **Branch:** \`${{ github.event.inputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Commit SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Services Deployed:** \`${{ needs.detect_changes.outputs.changed_services }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Namespace:** \`default\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Deployed by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Deployed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          fi
