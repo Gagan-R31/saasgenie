@@ -8,6 +8,18 @@ on:
         required: true
         type: string
         default: 'main'
+      deploy_option:
+        description: 'Deployment option'
+        required: true
+        type: choice
+        options:
+          - 'Deploy all changed services'
+          - 'Deploy specific service'
+        default: 'Deploy all changed services'
+      service_name:
+        description: 'Service name (only if "Deploy specific service" is selected)'
+        required: false
+        type: string
 
 env:
   NAMESPACE: default
@@ -19,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed_services: ${{ steps.detect.outputs.changed_services }}
+      services_to_deploy: ${{ steps.detect.outputs.services_to_deploy }}
       code_changed: ${{ steps.detect.outputs.code_changed }}
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +43,11 @@ jobs:
         shell: bash
         run: |
           BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+          DEPLOY_OPTION="${{ github.event.inputs.deploy_option }}"
+          SPECIFIC_SERVICE="${{ github.event.inputs.service_name }}"
+          
           echo "Detecting changes in branch: ${BRANCH_NAME}"
+          echo "Deploy option: ${DEPLOY_OPTION}"
           
           # Compare with main branch to detect what services exist/changed
           if git rev-parse --verify origin/main >/dev/null 2>&1; then
@@ -77,18 +94,52 @@ jobs:
             echo "Services with changes: $changed_services"
           fi
 
-          echo "JSON array: $changed_services_json"
+          # Determine which services to actually deploy
+          services_to_deploy=""
+          if [ "$DEPLOY_OPTION" == "Deploy specific service" ]; then
+            if [ -z "$SPECIFIC_SERVICE" ]; then
+              echo "ERROR: service_name is required when 'Deploy specific service' is selected"
+              exit 1
+            fi
+            
+            # Check if the specific service exists
+            if [ ! -d "services/$SPECIFIC_SERVICE" ]; then
+              echo "ERROR: Service '$SPECIFIC_SERVICE' does not exist in the repository"
+              echo "Available services:"
+              ls -1 services/
+              exit 1
+            fi
+            
+            services_to_deploy="$SPECIFIC_SERVICE"
+            echo "Deploying specific service: $SPECIFIC_SERVICE"
+          else
+            # Deploy all changed services
+            services_to_deploy="$changed_services"
+            echo "Deploying all changed services: $services_to_deploy"
+          fi
+
+          if [ -z "$services_to_deploy" ]; then
+            services_to_deploy_json="[]"
+            echo "No services to deploy"
+          else
+            services_to_deploy_json=$(printf '%s\n' $services_to_deploy | jq -R . | jq -s -c .)
+            echo "Services to deploy: $services_to_deploy"
+          fi
+
+          echo "Changed services JSON: $changed_services_json"
+          echo "Services to deploy JSON: $services_to_deploy_json"
 
           echo "code_changed=$code_changed" >> "$GITHUB_OUTPUT"
           echo "changed_services=$changed_services_json" >> "$GITHUB_OUTPUT"
+          echo "services_to_deploy=$services_to_deploy_json" >> "$GITHUB_OUTPUT"
 
   build_and_push:
     needs: detect_changes
-    if: ${{ needs.detect_changes.outputs.changed_services != '[]' && needs.detect_changes.outputs.changed_services != '' }}
+    if: ${{ needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        service: ${{ fromJson(needs.detect_changes.outputs.changed_services) }}
+        service: ${{ fromJson(needs.detect_changes.outputs.services_to_deploy) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -188,13 +239,13 @@ jobs:
 
   deploy:
     needs: [detect_changes, build_and_push]
-    if: ${{ needs.detect_changes.outputs.changed_services != '[]' && needs.detect_changes.outputs.changed_services != '' }}
+    if: ${{ needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' }}
     runs-on: ubuntu-latest
     environment: 
       name: ${{ github.event.inputs.branch_name == 'main' && 'production' || github.event.inputs.branch_name == 'staging' && 'staging' || 'development' }}
     strategy:
       matrix:
-        service: ${{ fromJson(needs.detect_changes.outputs.changed_services) }}
+        service: ${{ fromJson(needs.detect_changes.outputs.services_to_deploy) }}
     
     steps:
       - name: Checkout code
@@ -280,12 +331,25 @@ jobs:
     steps:
       - name: Deployment summary
         run: |
-          if [ "${{ needs.detect_changes.outputs.changed_services }}" == "[]" ] || [ -z "${{ needs.detect_changes.outputs.changed_services }}" ]; then
+          DEPLOY_OPTION="${{ github.event.inputs.deploy_option }}"
+          CHANGED_SERVICES="${{ needs.detect_changes.outputs.changed_services }}"
+          SERVICES_TO_DEPLOY="${{ needs.detect_changes.outputs.services_to_deploy }}"
+          
+          if [ "$SERVICES_TO_DEPLOY" == "[]" ] || [ -z "$SERVICES_TO_DEPLOY" ]; then
             echo "## ⏭️ No Deployment Needed" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Details" >> $GITHUB_STEP_SUMMARY
             echo "- **Branch:** \`${{ github.event.inputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Reason:** No service changes detected in this branch" >> $GITHUB_STEP_SUMMARY
+            echo "- **Deploy Option:** \`$DEPLOY_OPTION\`" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$DEPLOY_OPTION" == "Deploy all changed services" ]; then
+              echo "- **Reason:** No service changes detected in this branch" >> $GITHUB_STEP_SUMMARY
+              echo "- **Changed Services:** None" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Specific Service:** \`${{ github.event.inputs.service_name }}\`" >> $GITHUB_STEP_SUMMARY
+              echo "- **Reason:** Service specified but validation may have failed" >> $GITHUB_STEP_SUMMARY
+            fi
+            
             echo "- **Action:** Deployment skipped" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "💡 **Tip:** Changes are detected by comparing with the main branch. If this is a new branch with no differences, no deployment will occur." >> $GITHUB_STEP_SUMMARY
@@ -295,7 +359,14 @@ jobs:
             echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
             echo "- **Branch:** \`${{ github.event.inputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Commit SHA:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-            echo "- **Services Deployed:** \`${{ needs.detect_changes.outputs.changed_services }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Deploy Option:** \`$DEPLOY_OPTION\`" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$DEPLOY_OPTION" == "Deploy specific service" ]; then
+              echo "- **Specific Service Selected:** \`${{ github.event.inputs.service_name }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "- **Changed Services in Branch:** \`$CHANGED_SERVICES\`" >> $GITHUB_STEP_SUMMARY
+            echo "- **Services Deployed:** \`$SERVICES_TO_DEPLOY\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Namespace:** \`default\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Deployed by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
             echo "- **Deployed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
