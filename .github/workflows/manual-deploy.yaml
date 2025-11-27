@@ -20,6 +20,11 @@ on:
         description: 'Service name (only if "Deploy specific service" is selected)'
         required: false
         type: string
+      skip_verify:
+        description: 'Skip verification (format check and tests)'
+        required: false
+        type: boolean
+        default: false
 
 env:
   NAMESPACE: default
@@ -146,9 +151,54 @@ jobs:
           echo "changed_services=$changed_services_json" >> "$GITHUB_OUTPUT"
           echo "services_to_deploy=$services_to_deploy_json" >> "$GITHUB_OUTPUT"
 
-  build_and_push:
+  verify:
+    name: Verify ${{ matrix.service }}
     needs: detect_changes
-    if: ${{ needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' }}
+    if: ${{ github.event.inputs.skip_verify != 'true' && needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect_changes.outputs.services_to_deploy) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch_name }}
+          
+      - name: Install dependencies
+        working-directory: services/${{ matrix.service }}
+        run: |
+          if [ -f requirements.txt ]; then
+            echo "Installing Python dependencies..."
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found in services/${{ matrix.service }}"
+          fi
+
+      - name: Build other make dependencies
+        working-directory: base-images
+        run: |
+          FALCON_HOME=${{ github.workspace }} KUBE_ENV=dev make build-lint
+
+      - name: Run formatting check
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "Checking code formatting for ${{ matrix.service }}..."
+          FALCON_HOME=${{ github.workspace }} KUBE_ENV=dev make check-format
+
+      - name: Run linting
+        working-directory: services/${{ matrix.service }}
+        run: echo "No linting defined yet"
+
+      - name: Run tests
+        working-directory: services/${{ matrix.service }}
+        run: |
+          echo "Running tests for ${{ matrix.service }}..."
+          FALCON_HOME=${{ github.workspace }} KUBE_ENV=dev make test SHOULD_PUSH=false
+
+  build_and_push:
+    needs: [detect_changes, verify]
+    if: ${{ always() && needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -201,6 +251,8 @@ jobs:
           SHOULD_PUSH=true \
           make build
           
+          echo "✅ Built and pushed: ${{ env.REGISTRY }}/$IMAGE_NAME:${{ github.sha }}"
+          
           # Tag with branch-specific tag
           docker tag ${{ env.REGISTRY }}/$IMAGE_NAME:${{ github.sha }} ${{ env.REGISTRY }}/$IMAGE_NAME:$BRANCH_TAG
           docker push ${{ env.REGISTRY }}/$IMAGE_NAME:$BRANCH_TAG
@@ -222,8 +274,8 @@ jobs:
           fi
 
   deploy:
-    needs: [detect_changes, build_and_push]
-    if: ${{ needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' }}
+    needs: [detect_changes, verify, build_and_push]
+    if: ${{ always() && needs.detect_changes.outputs.services_to_deploy != '[]' && needs.detect_changes.outputs.services_to_deploy != '' && needs.build_and_push.result == 'success' }}
     runs-on: ubuntu-latest
     environment: 
       name: ${{ github.event.inputs.branch_name == 'main' && 'production' || github.event.inputs.branch_name == 'staging' && 'staging' || 'development' }}
@@ -312,7 +364,7 @@ jobs:
           kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.DEPLOYMENT_NAME }} -o wide
 
   summary:
-    needs: [detect_changes, build_and_push, deploy]
+    needs: [detect_changes, verify, build_and_push, deploy]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -322,6 +374,10 @@ jobs:
           CHANGED_SERVICES="${{ needs.detect_changes.outputs.changed_services }}"
           SERVICES_TO_DEPLOY="${{ needs.detect_changes.outputs.services_to_deploy }}"
           KUBE_ENV="${{ needs.detect_changes.outputs.kube_env }}"
+          SKIP_VERIFY="${{ github.event.inputs.skip_verify }}"
+          VERIFY_RESULT="${{ needs.verify.result }}"
+          BUILD_RESULT="${{ needs.build_and_push.result }}"
+          DEPLOY_RESULT="${{ needs.deploy.result }}"
           
           if [ "$SERVICES_TO_DEPLOY" == "[]" ] || [ -z "$SERVICES_TO_DEPLOY" ]; then
             echo "## ⏭️ No Deployment Needed" >> $GITHUB_STEP_SUMMARY
@@ -342,7 +398,12 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "💡 **Tip:** Changes are detected by comparing with the main branch. If this is a new branch with no differences, no deployment will occur." >> $GITHUB_STEP_SUMMARY
           else
-            echo "## ✅ Manual Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            if [ "$DEPLOY_RESULT" == "success" ]; then
+              echo "## ✅ Manual Deployment Successful" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "## ❌ Deployment Failed or Incomplete" >> $GITHUB_STEP_SUMMARY
+            fi
+            
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Deployment Details" >> $GITHUB_STEP_SUMMARY
             echo "- **Branch:** \`${{ github.event.inputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
@@ -354,6 +415,35 @@ jobs:
               echo "- **Specific Service Selected:** \`${{ github.event.inputs.service_name }}\`" >> $GITHUB_STEP_SUMMARY
             fi
             
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Pipeline Stages" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$SKIP_VERIFY" == "true" ]; then
+              echo "- **Verify:** ⏭️ Skipped (skip_verify=true)" >> $GITHUB_STEP_SUMMARY
+            else
+              if [ "$VERIFY_RESULT" == "success" ]; then
+                echo "- **Verify:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+              elif [ "$VERIFY_RESULT" == "skipped" ]; then
+                echo "- **Verify:** ⏭️ Skipped" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "- **Verify:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+            
+            if [ "$BUILD_RESULT" == "success" ]; then
+              echo "- **Build & Push:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Build & Push:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if [ "$DEPLOY_RESULT" == "success" ]; then
+              echo "- **Deploy:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Deploy:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Services" >> $GITHUB_STEP_SUMMARY
             echo "- **Changed Services in Branch:** \`$CHANGED_SERVICES\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Services Deployed:** \`$SERVICES_TO_DEPLOY\`" >> $GITHUB_STEP_SUMMARY
             echo "- **Namespace:** \`default\`" >> $GITHUB_STEP_SUMMARY
