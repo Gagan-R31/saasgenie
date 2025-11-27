@@ -53,28 +53,48 @@ jobs:
           chmod 600 $HOME/.kube/config
           kubectl cluster-info
       
-      - name: Deploy to production
+      - name: Deploy to production using Makefile
         run: |
           changed_services=$(echo '${{ needs.detect_changes.outputs.changed_services }}' | jq -r '.[]')
           
           for service in $changed_services; do
+            echo "=========================================="
+            echo "Deploying $service to production..."
+            echo "=========================================="
+            
+            cd services/$service
+            
+            # Determine image name
             if [ "$service" == "web-ui" ]; then
-              echo "Deploying web-ui to production..."
-              
-              # Update to latest tag (production)
-              kubectl set image deployment/demo \
-                demo=gaganr31/demo:latest \
-                -n default \
-                --record
-              
-              # Wait for rollout
-              kubectl rollout status deployment/demo -n default --timeout=5m
-              
-              echo "✅ Production deployment complete"
+              IMAGE_NAME="demo"
+            else
+              IMAGE_NAME="mg-fp-$service"
             fi
+            
+            FULL_IMAGE="gaganr31/${IMAGE_NAME}:latest"
+            
+            # Update deployment.yaml with the new image
+            if [ -f "k8s/base/deployment.yaml" ]; then
+              echo "Updating deployment.yaml with image: ${FULL_IMAGE}"
+              sed -i "s|image: .*${IMAGE_NAME}.*|image: ${FULL_IMAGE}|g" k8s/base/deployment.yaml
+              
+              # Deploy using Makefile
+              FALCON_HOME=$GITHUB_WORKSPACE \
+              KUBE_ENV=production \
+              REGISTRY=gaganr31 \
+              IMAGE_NAME=$IMAGE_NAME \
+              IMAGE_TAG_SHA=latest \
+              make deploy
+              
+              echo "✅ Production deployment complete for $service"
+            else
+              echo "⚠️  No k8s/base/deployment.yaml found for $service, skipping deployment"
+            fi
+            
+            cd -
           done
       
       - name: Verify deployment
         run: |
-          kubectl get deployment demo -n default
+          kubectl get deployments -n default
           kubectl get pods -n default -l app=demo
