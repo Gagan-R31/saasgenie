@@ -60,23 +60,30 @@ jobs:
           # Set environment tag based on source branch
           if [ "$SOURCE_BRANCH" == "staging" ]; then
             ENV_TAG="staging"
+            KUBE_ENV="staging"
           elif [ "$SOURCE_BRANCH" == "main" ]; then
             ENV_TAG="production"
+            KUBE_ENV="production"
           else
             # For feature branches, use branch name as tag (sanitize for Docker)
             ENV_TAG=$(echo "$SOURCE_BRANCH" | sed 's/[^a-zA-Z0-9._-]/-/g')
+            KUBE_ENV="dev"
           fi
           
           echo "env_tag=${ENV_TAG}" >> $GITHUB_OUTPUT
+          echo "kube_env=${KUBE_ENV}" >> $GITHUB_OUTPUT
           echo "Source Branch: ${SOURCE_BRANCH}"
           echo "Target Branch: ${TARGET_BRANCH}"
           echo "Environment Tag: ${ENV_TAG}"
+          echo "Kube Environment: ${KUBE_ENV}"
 
-      - name: Build Docker Images
+      - name: Build and Push Docker Images using Makefile
         run: |
           changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
           for service in $changed_services; do
-            echo "Building $service..."
+            echo "=========================================="
+            echo "Building and pushing $service..."
+            echo "=========================================="
             cd services/$service
             
             # Determine image name based on service
@@ -86,54 +93,41 @@ jobs:
               IMAGE_NAME="mg-fp-$service"
             fi
             
-            FALCON_HOME=$GITHUB_WORKSPACE KUBE_ENV=dev make build \
-              REGISTRY=gaganr31 \
-              IMAGE_NAME=$IMAGE_NAME \
-              IMAGE_TAG_SHA=${{ github.sha }} \
-              SHOULD_CACHE=true SHOULD_PUSH=false
-            cd -
-          done
-      
-      - name: Push Docker Images
-        run: |
-          changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
-          for service in $changed_services; do
-            echo "Pushing $service..."
-            
-            # Determine image name based on service
-            if [ "$service" == "web-ui" ]; then
-              IMAGE_NAME="demo"
-            else
-              IMAGE_NAME="mg-fp-$service"
-            fi
-            
-            BASE_IMAGE=gaganr31/$IMAGE_NAME
             SOURCE_BRANCH="${{ steps.tags.outputs.source_branch }}"
             ENV_TAG="${{ steps.tags.outputs.env_tag }}"
+            KUBE_ENV="${{ steps.tags.outputs.kube_env }}"
             
-            # Always push commit SHA tag
-            docker push $BASE_IMAGE:${{ github.sha }}
-            echo "✅ Pushed: $BASE_IMAGE:${{ github.sha }}"
+            # Build and push using Makefile
+            FALCON_HOME=$GITHUB_WORKSPACE \
+            KUBE_ENV=$KUBE_ENV \
+            REGISTRY=gaganr31 \
+            IMAGE_NAME=$IMAGE_NAME \
+            IMAGE_TAG_SHA=${{ github.sha }} \
+            SHOULD_CACHE=true \
+            SHOULD_PUSH=true \
+            make build
             
-            # Push branch-specific tag
-            docker tag $BASE_IMAGE:${{ github.sha }} $BASE_IMAGE:$ENV_TAG
-            docker push $BASE_IMAGE:$ENV_TAG
-            echo "✅ Pushed: $BASE_IMAGE:$ENV_TAG"
+            # Tag with branch-specific tag
+            docker tag gaganr31/$IMAGE_NAME:${{ github.sha }} gaganr31/$IMAGE_NAME:$ENV_TAG
+            docker push gaganr31/$IMAGE_NAME:$ENV_TAG
+            echo "✅ Pushed: gaganr31/$IMAGE_NAME:$ENV_TAG"
             
-            # Only push 'latest' tag when merging to main (not on PR)
+            # Push 'latest' tag only when merging to main (not on PR)
             if [ "$SOURCE_BRANCH" == "main" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
-              docker tag $BASE_IMAGE:${{ github.sha }} $BASE_IMAGE:latest
-              docker push $BASE_IMAGE:latest
-              echo "✅ Pushed: $BASE_IMAGE:latest"
+              docker tag gaganr31/$IMAGE_NAME:${{ github.sha }} gaganr31/$IMAGE_NAME:latest
+              docker push gaganr31/$IMAGE_NAME:latest
+              echo "✅ Pushed: gaganr31/$IMAGE_NAME:latest"
             fi
             
             echo ""
             echo "📦 Summary for $service:"
-            echo "  - Commit SHA tag: $BASE_IMAGE:${{ github.sha }}"
-            echo "  - Branch tag: $BASE_IMAGE:$ENV_TAG"
+            echo "  - Commit SHA tag: gaganr31/$IMAGE_NAME:${{ github.sha }}"
+            echo "  - Branch tag: gaganr31/$IMAGE_NAME:$ENV_TAG"
             if [ "$SOURCE_BRANCH" == "main" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
-              echo "  - Latest tag: $BASE_IMAGE:latest"
+              echo "  - Latest tag: gaganr31/$IMAGE_NAME:latest"
             fi
+            
+            cd -
           done
       
       - name: Output image tags
@@ -143,11 +137,17 @@ jobs:
           echo "**Source Branch:** ${{ steps.tags.outputs.source_branch }}" >> $GITHUB_STEP_SUMMARY
           echo "**Target Branch:** ${{ steps.tags.outputs.target_branch }}" >> $GITHUB_STEP_SUMMARY
           echo "**Environment Tag:** ${{ steps.tags.outputs.env_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Kube Environment:** ${{ steps.tags.outputs.kube_env }}" >> $GITHUB_STEP_SUMMARY
           echo "**Commit SHA:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Available Tags:" >> $GITHUB_STEP_SUMMARY
-          echo "- \`gaganr31/demo:${{ github.sha }}\` (commit-specific)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`gaganr31/demo:${{ steps.tags.outputs.env_tag }}\` (branch-specific)" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ steps.tags.outputs.source_branch }}" == "main" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "- \`gaganr31/demo:latest\` (production)" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "### Services Built:" >> $GITHUB_STEP_SUMMARY
+          
+          changed_services=$(echo '${{ inputs.changed_services }}' | jq -r '.[]')
+          for service in $changed_services; do
+            if [ "$service" == "web-ui" ]; then
+              IMAGE_NAME="demo"
+            else
+              IMAGE_NAME="mg-fp-$service"
+            fi
+            echo "- **$service** → \`gaganr31/$IMAGE_NAME:${{ steps.tags.outputs.env_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          done
