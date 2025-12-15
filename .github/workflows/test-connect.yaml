@@ -1,0 +1,36 @@
+name: Deploy to AKS
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl with kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Verify cluster connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Deploy application
+        run: |
+          # Add your deployment commands here
+          # Example:
+          # kubectl apply -f k8s/deployment.yaml
+          # kubectl rollout status deployment/my-app
+          echo "Ready to deploy to AKS cluster"
